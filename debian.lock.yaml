@@ -1,0 +1,8 @@
+lockfileVersion: 1
+lockfileVendor: debian
+arches:
+  - arch: amd64
+    packages:
+      - url: http://ftp.uk.debian.org/debian/pool/main/h/hello/hello_2.10-5_amd64.deb
+        checksum: null
+        size: null
