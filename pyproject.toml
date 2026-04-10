@@ -1,0 +1,149 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools", "setuptools-scm"]
+
+[project]
+name = "hermeto"
+license = { text = "GPLv3+" }
+requires-python = ">=3.10"
+classifiers = [
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dynamic = ["version"]
+dependencies = [
+  "aiohttp",
+  "aiohttp-retry",
+  "createrepo-c ; sys_platform == 'linux'",
+  "gitpython",
+  "packageurl-python",
+  "packaging",
+  "pyarn",
+  "pydantic",
+  "pydantic-settings",
+  "pypi-simple",
+  "pyyaml",
+  "requests",
+  "semver",
+  "tenacity",
+  "tomlkit",
+  "typer",
+]
+[project.optional-dependencies]
+dev = [
+  "mkdocs-material",
+  "mypy",
+  "nox",
+  "ruff",
+  "typing-extensions",
+]
+test = [
+  "filelock",
+  "jsonschema",
+  "podman-compose",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+  "pytest-env",
+  "pytest-xdist",
+]
+[project.scripts]
+cachi2 = "hermeto.interface.cli:app"
+hermeto = "hermeto.interface.cli:app"
+
+[tool.setuptools]
+packages = ["hermeto"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0+dev.fallback"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "W",   # pycodestyle warnings
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "D1",  # Missing docstrings only
+    "I",   # isort
+    "S",   # bandit security rules
+    "ARG", # flake8 unused arguments
+]
+
+ignore = [
+    "D100",  # missing docstring in public module
+    "D104",  # missing docstring in public package
+    "D105",  # missing docstring in magic method
+    "E501",  # line too long
+    "E731",  # do not assign a lambda expression
+    "S404",  # import subprocess
+    "S603",  # subprocess_without_shell_equals_true
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "D101",  # missing docstring in public class
+    "D102",  # missing docstring in public method
+    "D103",  # missing docstring in public function
+    "S101",  # use of assert detected (expected in tests)
+    "S108",  # hardcoded temp paths (acceptable in tests)
+    "S113",  # requests call without timeout (acceptable in tests)
+    "S202",  # tarfile-unsafe-members (acceptable in tests)
+    "S311",  # suspicious-non-cryptographic-random-usage (acceptable in tests)
+    "ARG",   # flake8 unused arguments (expected in tests - mocking)
+]
+
+[tool.ruff.format]
+# Use Black-compatible formatting
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.10"
+plugins = ["pydantic.mypy"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_decorators = true
+
+# TODO: pyarn does not currently have type annotations
+[[tool.mypy.overrides]]
+module = "pyarn.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "nox.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "noxfile"
+disallow_untyped_decorators = false
+
+[tool.coverage.report]
+skip_covered = true
+show_missing = true
+fail_under = 90
+exclude_lines = [
+  "def __repr__",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+  "return NotImplemented",
+]
+
+[tool.pytest.ini_options]
+addopts = "--doctest-modules -n auto"
+log_cli_level = "DEBUG"
+log_format = "%(asctime)s %(levelname)s %(message)s"
+log_date_format = "%Y-%m-%d %H:%M:%S"
+markers = [
+  "no_proxy_mode: marks tests that are incompatible with HERMETO_TEST_LOCAL_NEXUS_PROXY=1",
+]
+tmp_path_retention_count = 1

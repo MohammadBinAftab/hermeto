@@ -1,0 +1,799 @@
+# SPDX-License-Identifier: GPL-3.0-only
+import hashlib
+import json
+import logging
+import re
+from collections import defaultdict
+from collections.abc import Iterable
+from datetime import datetime, timezone
+from functools import cached_property, partial, reduce
+from itertools import chain, groupby
+from pathlib import Path
+from typing import Annotated, Any, Literal, Union
+from urllib.parse import urlparse
+
+import pydantic
+from packageurl import PackageURL
+from typing_extensions import Self
+
+from hermeto import APP_NAME
+from hermeto.core.models.property_semantics import Property, PropertyEnum, PropertySet
+from hermeto.core.utils import first_for
+
+log = logging.getLogger(__name__)
+
+BACKEND_ANNOTATION_PREFIX = f"{APP_NAME}:backend:"
+
+
+def datetime_to_iso_8601(value: datetime) -> str:
+    """Serialize a datetime to a string in ISO 8601 standard."""
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+ISODatetime = Annotated[datetime, pydantic.PlainSerializer(datetime_to_iso_8601)]
+SortedSet = Annotated[set[str], pydantic.PlainSerializer(sorted, return_type=list[str])]
+
+
+class Annotation(pydantic.BaseModel):
+    """
+    A comment, note, explanation, or similar textual content
+    which provides additional context to the object(s) being annotated.
+
+    https://cyclonedx.org/docs/1.6/json/#annotations
+    """
+
+    subjects: SortedSet
+    annotator: dict[Literal["organization", "individual", "component", "service"], dict[str, str]]
+    timestamp: ISODatetime
+    text: str
+
+
+PROXY_REF_TYPE = "distribution"
+PROXY_COMMENT = "proxy URL"
+
+
+class ExternalReference(pydantic.BaseModel):
+    """An ExternalReference inside an SBOM component."""
+
+    url: str
+    # "distribution" URLs in conjunction with comment field set to "proxy URL"
+    # are to be used to indicate actual download location for a component when
+    # a package was downloaded through a proxy. Comment field is necessary
+    # since some package managers already use external references with type
+    # explicitly set to distribution. Multiple proxies must all be specified
+    # as separate ExternalReferences. This type of ExternalReference should be
+    # added along with "distribution" ExternalReference.
+    # NOTE: CycloneDX.ExternalReference != SPDX.ExternalReference!
+    type: Literal["distribution"] = "distribution"
+    comment: str | None = None
+
+
+class PatchDiff(pydantic.BaseModel):
+    """A Diff inside a Patch."""
+
+    url: str
+
+
+class Patch(pydantic.BaseModel):
+    """A Patch inside a SBOM Component Pedigree."""
+
+    type: Literal["backport", "cherry-pick", "monkey", "unofficial"] = "unofficial"
+    diff: PatchDiff
+
+
+class Pedigree(pydantic.BaseModel):
+    """A Pedigree inside a SBOM component."""
+
+    patches: list[Patch]
+
+
+FOUND_BY_APP_PROPERTY: Property = Property(name=PropertyEnum.PROP_FOUND_BY, value=f"{APP_NAME}")
+
+
+class Component(pydantic.BaseModel):
+    """A software component such as a dependency or a package.
+
+    Compliant to the CycloneDX specification:
+    https://cyclonedx.org/docs/1.6/json/#components
+    """
+
+    bom_ref: str = pydantic.Field(alias="bom-ref", default="")
+    name: str
+    purl: str
+    version: str | None = None
+    properties: list[Property] = pydantic.Field(default_factory=list, validate_default=True)
+    type: Literal["library", "file"] = "library"
+    external_references: list[ExternalReference] | None = pydantic.Field(
+        alias="externalReferences", default=None
+    )
+    pedigree: Pedigree | None = None
+
+    # Aliased fields may be populated by their name as given by the model attribute.
+    model_config = pydantic.ConfigDict(validate_by_name=True, extra="forbid")
+
+    @pydantic.model_validator(mode="after")
+    def _set_bom_ref_from_purl(self) -> Self:
+        """Set bom-ref to match the component's purl."""
+        self.bom_ref = self.purl
+        return self
+
+    def key(self) -> str:
+        """Uniquely identifies a package.
+
+        Used mainly for sorting and deduplication.
+        """
+        return self.purl
+
+    @pydantic.field_validator("version")
+    @classmethod
+    def _remove_empty_version(cls, version: str | None) -> str | None:
+        if not version:
+            return None
+
+        return version
+
+    @pydantic.field_validator("properties")
+    @classmethod
+    def _add_found_by_property(cls, properties: list[Property]) -> list[Property]:
+        if FOUND_BY_APP_PROPERTY not in properties:
+            properties.append(FOUND_BY_APP_PROPERTY)
+
+        return properties
+
+
+class Tool(pydantic.BaseModel):
+    """A tool used to generate the SBOM content."""
+
+    vendor: str
+    name: str
+
+
+class Metadata(pydantic.BaseModel):
+    """Metadata field in a SBOM."""
+
+    tools: list[Tool] = [Tool(vendor="red hat", name=f"{APP_NAME}")]
+
+
+def spdx_now() -> datetime:
+    """Return a time stamp in SPDX-compliant format.
+
+    See https://spdx.github.io/spdx-spec/v2.3/search.html?q=date
+    for details.
+    """
+    return datetime.now(timezone.utc)
+
+
+def create_backend_annotation(
+    components: list["Component"], backend_name: str
+) -> Annotation | None:
+    """Create an annotation that tags components with the backend that fetched them.
+
+    Experimental backends (those with an x- prefix) use a distinct label in the annotation text.
+
+    Returns None if there are no components to annotate.
+    """
+    if not components:
+        return None
+    if backend_name.startswith("x-"):
+        text = f"{BACKEND_ANNOTATION_PREFIX}experimental:{backend_name}"
+    else:
+        text = f"{BACKEND_ANNOTATION_PREFIX}{backend_name}"
+    return Annotation(
+        subjects={c.bom_ref for c in components},
+        annotator={"organization": {"name": "red hat"}},
+        timestamp=spdx_now(),
+        text=text,
+    )
+
+
+def sanitize_spdxid(spdxid: str) -> str:
+    """Sanitize an SPDXID.
+
+    See https://spdx.github.io/spdx-spec/v2.3/package-information/#7.2:
+
+    Format  "SPDXRef-"[idstring]
+            where [idstring] is a unique string containing letters, numbers, ., and/or -.
+    """
+    return re.sub(r"[^0-9a-zA-Z\.\-]", "-", spdxid)
+
+
+class Sbom(pydantic.BaseModel):
+    """Software bill of materials in the CycloneDX format.
+
+    See full specification at:
+    https://cyclonedx.org/docs/1.6/json
+    """
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    bom_format: Literal["CycloneDX"] = pydantic.Field(alias="bomFormat", default="CycloneDX")
+    annotations: list[Annotation] = []
+    components: list[Component] = []
+    metadata: Metadata = Metadata()
+    spec_version: str = pydantic.Field(alias="specVersion", default="1.6")
+    version: int = 1
+
+    @pydantic.model_serializer(mode="wrap")
+    def serialize_model(self, handler: pydantic.SerializerFunctionWrapHandler) -> dict[str, object]:
+        """
+        Custom serializer that removes the `annotations` field if it is empty.
+
+        https://docs.pydantic.dev/latest/concepts/serialization/#model-serializers
+        """
+        serialized = handler(self)
+        if not self.annotations:
+            serialized.pop("annotations")
+
+        return serialized
+
+    def __add__(self, other: Union["Sbom", "SPDXSbom"]) -> "Sbom":
+        if isinstance(other, self.__class__):
+            return Sbom(
+                # NOTE: We might consider deduplicating annotations based on the annotation text
+                # in the future. It is a very rare corner case, though, and it only matters when
+                # merging multiple CycloneDX SBOMs.
+                annotations=self.annotations + other.annotations,
+                components=merge_component_properties(
+                    chain.from_iterable(s.components for s in [self, other])
+                ),
+            )
+        else:
+            return self + other.to_cyclonedx()
+
+    @pydantic.field_validator("components")
+    @classmethod
+    def _unique_components(cls, components: list[Component]) -> list[Component]:
+        """Sort and de-duplicate components."""
+        return merge_component_properties(components)
+
+    def to_cyclonedx(self) -> Self:
+        """Return self, self is already the right type of Sbom."""
+        # This is a short-cut, but since it is unlikely that we would ever add more Sbom types
+        # it is acceptable. If, however this ever happens a proper base class will be needed.
+        return self
+
+    def to_spdx(self, doc_namespace: str) -> "SPDXSbom":
+        """Convert a CycloneDX SBOM to an SPDX SBOM.
+
+        Args:
+            doc_namespace: SPDX document namespace. Namespace is URI of indicating
+
+        """
+
+        def create_document_root() -> SPDXPackage:
+            return SPDXPackage(name="", versionInfo="", SPDXID="SPDXRef-DocumentRoot-File-")
+
+        def create_root_relationship() -> SPDXRelation:
+            return SPDXRelation(
+                spdxElementId="SPDXRef-DOCUMENT",
+                comment="",
+                relatedSpdxElement="SPDXRef-DocumentRoot-File-",
+                relationshipType="DESCRIBES",
+            )
+
+        def link_to_root(packages: list[SPDXPackage]) -> list[SPDXRelation]:
+            relationships, root_id, rtype = [], "SPDXRef-DocumentRoot-File-", "CONTAINS"
+            pRel = partial(SPDXRelation, spdxElementId=root_id, comment="", relationshipType=rtype)
+            for package in packages:
+                if package.SPDXID == "SPDXRef-DocumentRoot-File-":
+                    continue
+                relationships.append(pRel(relatedSpdxElement=package.SPDXID))
+            return relationships
+
+        def generate_package_annotations(
+            properties: list[Property], bom_ref: str | None = None
+        ) -> list[SPDXPackageAnnotation]:
+            """
+            Convert CycloneDX top-level annotations and component properties to SPDX package annotations.
+            """
+            result = []
+            base_spdx_annotation = partial(
+                SPDXPackageAnnotation,
+                annotator=f"Tool: {APP_NAME}:jsonencoded",
+                annotationDate=spdx_now(),
+                annotationType="OTHER",
+            )
+
+            for annotation in self.annotations:
+                if bom_ref in annotation.subjects:
+                    result.append(base_spdx_annotation(comment=annotation.text))
+
+            for property in properties:
+                result.append(
+                    base_spdx_annotation(
+                        comment=json.dumps(dict(name=f"{property.name}", value=f"{property.value}"))
+                    )
+                )
+
+            return result
+
+        def libs_to_packages(libraries: list[Component]) -> list[SPDXPackage]:
+            def source_infos(component: Component) -> list[str]:
+                if component.external_references is None:
+                    return []
+                is_proxy = lambda ref: ref.type == PROXY_REF_TYPE and ref.comment == PROXY_COMMENT
+                return sorted(ref.url for ref in component.external_references if is_proxy(ref))
+
+            packages = []
+
+            hashdict = lambda c: dict(name=c.name, version=c.version, purl=c.purl)
+            erefbase = dict(referenceCategory="PACKAGE-MANAGER", referenceType="purl")
+            erefdict = lambda c: dict(referenceLocator=c.purl, **erefbase)
+
+            for component in libraries:
+                package_hash = SPDXPackage._calculate_package_hash_from_dict(hashdict(component))
+
+                if component.version:
+                    human_readable_id = f"{component.name}-{component.version}"
+                else:
+                    human_readable_id = component.name
+
+                source_info = ";".join(source_infos(component))
+                packages.append(
+                    SPDXPackage(
+                        SPDXID=sanitize_spdxid(
+                            f"SPDXRef-Package-{human_readable_id}-{package_hash}"
+                        ),
+                        name=component.name,
+                        versionInfo=component.version,
+                        externalRefs=[erefdict(component)],
+                        annotations=generate_package_annotations(
+                            properties=component.properties, bom_ref=component.bom_ref
+                        ),
+                        sourceInfo=source_info or None,
+                    )
+                )
+            return packages
+
+        # Main function body.
+        packages = [create_document_root()] + libs_to_packages(self.components)
+        relationships = [create_root_relationship()] + link_to_root(packages)
+        creator = lambda tool: [f"Tool: {tool.name}", f"Organization: {tool.vendor}"]
+        return SPDXSbom(
+            packages=packages,
+            relationships=relationships,
+            documentNamespace=doc_namespace,
+            creationInfo=SPDXCreationInfo(
+                creators=sum([creator(tool) for tool in self.metadata.tools], []),
+                created=spdx_now(),
+            ),
+        )
+
+
+class SPDXPackageExternalRefReferenceLocatorURI(pydantic.BaseModel):
+    """SPDX Package External Reference with URI reference locator."""
+
+    referenceLocator: str
+
+    @pydantic.field_validator("referenceLocator")
+    @classmethod
+    def _validate_uri_reference_locator(cls, referenceLocator: str) -> str:
+        parsed = urlparse(referenceLocator)
+        if not (parsed.scheme and (parsed.path or parsed.netloc)):
+            raise ValueError("Invalid URI reference locator")
+        return referenceLocator
+
+
+class SPDXPackageExternalRef(pydantic.BaseModel):
+    """SPDX Package External Reference.
+
+    Compliant to the SPDX specification:
+    https://spdx.github.io/spdx-spec/v2.3/package-information/#721-external-reference-field
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True)
+
+    referenceLocator: str
+    referenceType: str
+    referenceCategory: str
+
+    def __hash__(self) -> int:
+        return hash((self.referenceLocator, self.referenceType, self.referenceCategory))
+
+
+class SPDXPackageExternalRefSecurity(SPDXPackageExternalRef):
+    """SPDX Package External Reference for category package-manager.
+
+    Compliant to the SPDX specification:
+    https://spdx.github.io/spdx-spec/v2.3/package-information/#721-external-reference-field
+    """
+
+    referenceCategory: Literal["SECURITY"]
+
+
+class SPDXPackageExternalRefPackageManager(SPDXPackageExternalRef):
+    """SPDX Package External Reference for category package-manager.
+
+    Compliant to the SPDX specification:
+    https://spdx.github.io/spdx-spec/v2.3/package-information/#721-external-reference-field
+    """
+
+    referenceCategory: Literal["PACKAGE-MANAGER"]
+
+
+class SPDXPackageExternalRefPackageManagerPURL(
+    SPDXPackageExternalRefPackageManager, SPDXPackageExternalRefReferenceLocatorURI
+):
+    """SPDX Package External Reference for category package-manager and type purl.
+
+    Compliant to the SPDX specification:
+    https://spdx.github.io/spdx-spec/v2.3/package-information/#721-external-reference-field
+    """
+
+    referenceCategory: Literal["PACKAGE-MANAGER"]
+    referenceType: Literal["purl"]
+
+
+class SPDXPackageExternalRefSecurityPURL(
+    SPDXPackageExternalRefSecurity, SPDXPackageExternalRefReferenceLocatorURI
+):
+    """SPDX Package External Reference for category package-manager and type purl.
+
+    Compliant to the SPDX specification:
+    https://spdx.github.io/spdx-spec/v2.3/package-information/#721-external-reference-field
+    """
+
+    referenceCategory: Literal["SECURITY"]
+    referenceType: Literal["cpe23Type"]
+
+
+SPDXPackageExternalRefPackageManagerType = Annotated[
+    SPDXPackageExternalRefPackageManagerPURL,
+    pydantic.Field(discriminator="referenceType"),
+]
+
+SPDXPackageExternalRefSecurityType = Annotated[
+    SPDXPackageExternalRefSecurityPURL,
+    pydantic.Field(discriminator="referenceType"),
+]
+
+
+SPDXPackageExternalRefType = Annotated[
+    SPDXPackageExternalRefPackageManagerType | SPDXPackageExternalRefSecurityType,
+    pydantic.Field(discriminator="referenceCategory"),
+]
+
+
+class SPDXPackageAnnotation(pydantic.BaseModel):
+    """SPDX Package Annotation.
+
+    Compliant to the SPDX specification:
+    https://github.com/spdx/spdx-spec/blob/development/v2.3/schemas/spdx-schema.json#L237
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True)
+
+    annotator: str
+    annotationDate: ISODatetime
+    annotationType: Literal["OTHER", "REVIEW"]
+    comment: str
+
+    def __hash__(self) -> int:
+        return hash((self.annotator, self.annotationDate, self.annotationType, self.comment))
+
+
+def _extract_purls(from_refs: list[SPDXPackageExternalRefType]) -> list[str]:
+    return [ref.referenceLocator for ref in from_refs if ref.referenceType == "purl"]
+
+
+def _parse_purls(purls: list[str]) -> list[PackageURL]:
+    return [PackageURL.from_string(purl) for purl in purls if purl]
+
+
+class SPDXPackage(pydantic.BaseModel):
+    """SPDX Package.
+
+    Compliant to the SPDX specification:
+    https://spdx.github.io/spdx-spec/v2.3/package-information/
+    """
+
+    SPDXID: str
+    name: str
+    versionInfo: str | None = None
+    externalRefs: list[SPDXPackageExternalRefType] = []
+    annotations: list[SPDXPackageAnnotation] = []
+    downloadLocation: str = "NOASSERTION"
+    # sourceInfo should be present if proxy URL were set for a package
+    # manager. If more than one URL were provided then individual URLs
+    # should be separated with semicolons.
+    sourceInfo: str | None = None
+
+    def __lt__(self, other: "SPDXPackage") -> bool:
+        return (self.SPDXID or "") < (other.SPDXID or "")
+
+    def __hash__(self) -> int:
+        return hash(
+            hash(self.SPDXID)
+            + hash(self.name)
+            + hash(self.versionInfo)
+            + hash(self.downloadLocation)
+            + sum(hash(e) for e in self.externalRefs)
+            + sum(hash(a) for a in self.annotations)
+            # NOTE: in an exceptionally rare case there could be a slim chance of collision here.
+            + hash(self.sourceInfo)
+        )
+
+    @staticmethod
+    def _calculate_package_hash_from_dict(package_dict: dict[str, Any]) -> str:
+        return hashlib.sha256(json.dumps(package_dict, sort_keys=True).encode()).hexdigest()
+
+    @pydantic.field_validator("externalRefs")
+    @classmethod
+    def _purls_validation(
+        cls, refs: list[SPDXPackageExternalRefType]
+    ) -> list[SPDXPackageExternalRefType]:
+        """Validate that SPDXPackage includes only one purl with the same type, name, version."""
+        parsed_purls = _parse_purls(_extract_purls(from_refs=refs))
+        unique_purls_parts = set([(p.type, p.name, p.version) for p in parsed_purls])
+        if len(unique_purls_parts) > 1:
+            raise ValueError(
+                "SPDXPackage includes multiple purls with different (type,name,version) tuple: "
+                + f"{unique_purls_parts}"
+            )
+        return refs
+
+
+class SPDXCreationInfo(pydantic.BaseModel):
+    """SPDX Creation Information.
+
+    Compliant to the SPDX specification:
+    https://spdx.github.io/spdx-spec/v2.3/document-creation-information/
+    """
+
+    creators: list[str] = []
+    created: ISODatetime
+
+    def __hash__(self) -> int:
+        return hash((tuple(self.creators), self.created))
+
+
+class SPDXRelation(pydantic.BaseModel):
+    """SPDX Relationship.
+
+    Compliant to the SPDX specification:
+    https://spdx.github.io/spdx-spec/v2.3/relationships-between-SPDX-elements/
+    """
+
+    spdxElementId: str
+    comment: str | None = None
+    relatedSpdxElement: str
+    relationshipType: str
+
+    def __hash__(self) -> int:
+        return hash(
+            hash(self.spdxElementId + self.relatedSpdxElement + self.relationshipType)
+            + hash(self.comment)
+        )
+
+
+class SPDXSbom(pydantic.BaseModel):
+    """Software bill of materials in the SPDX format.
+
+    See full specification at:
+    https://spdx.github.io/spdx-spec/v2.3
+    """
+
+    # NOTE: The model is intentionally made non-strict for now because a strict model rejects
+    # SBOMs generated by Syft. It is unclear at the moment if additional preprocessing will
+    # be happening or desired.
+    # This is also a reason to not make the model frozen.
+
+    spdxVersion: Literal["SPDX-2.3"] = "SPDX-2.3"
+    SPDXID: Literal["SPDXRef-DOCUMENT"] = "SPDXRef-DOCUMENT"
+    dataLicense: Literal["CC0-1.0"] = "CC0-1.0"
+    name: str = ""
+    documentNamespace: str
+
+    creationInfo: SPDXCreationInfo
+    packages: list[SPDXPackage] = []
+    relationships: list[SPDXRelation] = []
+
+    def __hash__(self) -> int:
+        return hash(
+            hash(self.name + self.documentNamespace)
+            + hash(self.creationInfo)
+            + sum(hash(p) for p in self.packages)
+            + sum(hash(r) for r in self.relationships)
+        )
+
+    @classmethod
+    def from_file(cls, path: Path) -> "SPDXSbom":
+        """Consume a SPDX json directly from a file."""
+        return cls.model_validate_json(path.read_text())
+
+    @staticmethod
+    def deduplicate_spdx_packages(items: Iterable[SPDXPackage]) -> list[SPDXPackage]:
+        """Deduplicate SPDX packages and merge external references.
+
+        Deduplication is very conservative and does not consider two packages same if
+        their purls differ even if their type, name and version match. A package will be
+        dropped iff it is a full purl match.
+        """
+        unique_items: dict[int, SPDXPackage] = {}
+        for item in items:
+            purls = _extract_purls(item.externalRefs)
+            if purls:
+                purl_key = hash(sum(hash(p) for p in _parse_purls(purls)))
+            else:
+                # This is likely just the root.
+                log.warning(f"No purls found for {item}.")
+                purl_key = hash(("", item.name, item.versionInfo or ""))
+
+            if purl_key in unique_items:
+                unique_items[purl_key].externalRefs.extend(item.externalRefs)
+                unique_items[purl_key].annotations.extend(item.annotations)
+            else:
+                unique_items[purl_key] = item.model_copy(deep=True)
+
+        for item in unique_items.values():
+            item.externalRefs = sorted(
+                set(item.externalRefs),
+                key=lambda ref: (ref.referenceLocator, ref.referenceType, ref.referenceCategory),
+            )
+            item.annotations = sorted(
+                set(item.annotations),
+                key=lambda ann: (ann.annotator, ann.annotationDate, ann.comment),
+            )
+        return sorted(unique_items.values(), key=lambda item: (item.name, item.versionInfo or ""))
+
+    @pydantic.field_validator("packages")
+    @classmethod
+    def _unique_packages(cls, packages: list[SPDXPackage]) -> list[SPDXPackage]:
+        """Sort and de-duplicate components."""
+        return cls.deduplicate_spdx_packages(packages)
+
+    @cached_property
+    def root_id(self) -> str:
+        """Return the root_id of this SBOM."""
+        direct_relationships, inverse_relationships = defaultdict(list), dict()
+        for rel in self.relationships:
+            direct_relationships[rel.spdxElementId].append(rel.relatedSpdxElement)
+            inverse_relationships[rel.relatedSpdxElement] = rel.spdxElementId
+        unidirectionally_related_package = lambda p: inverse_relationships.get(p) == self.SPDXID
+        # Note: defaulting to top-level SPDXID is inherited from the original implementation.
+        # It is unclear if it is really needed, but is left around to match the precedent.
+        root_id = first_for(unidirectionally_related_package, direct_relationships, self.SPDXID)
+        return root_id
+
+    # NOTE: having this as cached will cause trouble when sequentially
+    # constructing the object off of an empty state.
+    @property
+    def non_root_packages(self) -> list[SPDXPackage]:
+        """Return non-root packages."""
+        return [p for p in self.packages if p.SPDXID != self.root_id]
+
+    @staticmethod
+    def retarget_and_prune_relationships(
+        from_sbom: "SPDXSbom",
+        to_sbom: "SPDXSbom",
+    ) -> list[SPDXRelation]:
+        """Retarget and prune relationships."""
+        out, from_root, to_root = [], from_sbom.root_id, to_sbom.root_id
+        for r in from_sbom.relationships:
+            # New relation must be with to_sbom root if old relation was of from_sbom root.
+            # New relation must also be moved to new root if it was with from_sbom root.
+            # These two moves cannot happen simultaneously.
+            eid = r.spdxElementId
+            if from_root in (eid, r.relatedSpdxElement):
+                n_spdxEI = to_root
+            else:
+                n_spdxEI = eid
+            # Do a copy to ensure we are not pulling a carpet from underneath us:
+            new_rel = r.model_copy(update={"spdxElementId": n_spdxEI}, deep=True)
+            if not (
+                new_rel.relatedSpdxElement == from_sbom.root_id
+                and new_rel.relationshipType == "DESCRIBES"
+            ):
+                out.append(new_rel)
+        return out
+
+    def __add__(self, other: Union["SPDXSbom", Sbom]) -> "SPDXSbom":
+        if isinstance(other, self.__class__):
+            # Packages are not going to be modified so it is OK to just pass
+            # references around.
+            merged_packages = self.packages + other.non_root_packages
+            # Relationships, on the other hand, are amended, so new
+            # relationships will be constructed. Further, identical
+            # relationships should be dropped. Deduplication based on building
+            # a set is considered safe because all fields of all elements are
+            # used to compute a hash.
+            processed_other = self.retarget_and_prune_relationships(from_sbom=other, to_sbom=self)
+            merged_relationships = list(set(self.relationships + processed_other))
+            res = self.model_copy(
+                update={
+                    # At the moment of writing pydantic does not deem it necessary to
+                    # validate updated fields because we should just trust them [1].
+                    "packages": self.deduplicate_spdx_packages(merged_packages),
+                    "relationships": merged_relationships,
+                },
+                deep=True,
+            )
+            return res
+        elif isinstance(other, Sbom):
+            return self + other.to_spdx(doc_namespace="NOASSERTION")
+        else:
+            self_class = self.__class__.__name__
+            other_class = other.__class__.__name__
+            raise ValueError(f"Cannot merge {other_class} to {self_class}")
+
+    def to_spdx(self, *a: Any, **k: Any) -> Self:  # noqa: ARG002
+        """Return self, ignore arguments, self is already a SPDX document."""
+        # This is a short-cut, but since it is unlikely that we would ever add more Sbom types
+        # it is acceptable. If, however this ever happens a proper base class will be needed.
+        return self
+
+    def to_cyclonedx(self) -> Sbom:
+        """Convert a SPDX SBOM to a CycloneDX SBOM."""
+        components = []
+        eref_rest = dict(type=PROXY_REF_TYPE, comment=PROXY_COMMENT)
+        for package in self.packages:
+            properties = [
+                (
+                    Property(**json.loads(an.comment))
+                    if an.annotator.endswith(":jsonencoded")
+                    else Property(name=an.annotator, value=an.comment)
+                )
+                for an in package.annotations
+            ]
+            # sourceInfo morphs into ExternalReference of type PROXY_REF_TYPE
+            # with PROXY_COMMENT comment
+            if package.sourceInfo is not None:
+                actual_download_urls = package.sourceInfo.split(";")
+                exrefs = [ExternalReference(url=url, **eref_rest) for url in actual_download_urls]
+            else:
+                exrefs = None
+            pComponent = partial(
+                Component,
+                name=package.name,
+                version=package.versionInfo,
+                properties=properties,
+                external_references=exrefs,
+            )
+            purls = _extract_purls(package.externalRefs)
+
+            # cyclonedx doesn't support multiple purls, therefore
+            # new component is created for each purl
+            components += [pComponent(purl=purl) for purl in purls]
+            # if there's no purl and no package name or version, it's just wrapping element for
+            # spdx package which is one layer bellow SPDXDocument in relationships
+            if not any((purls, package.name, package.versionInfo)):
+                continue
+            # if there's no purl, add it as single component
+            elif not purls:
+                components.append(pComponent(purl=""))
+        tools = []
+        name, vendor = None, None
+        # Following approach is used as position of "Organization" and "Tool" is not
+        # guaranteed by the standard
+        for creator in self.creationInfo.creators:
+            if creator.startswith("Organization:"):
+                vendor = creator.replace("Organization:", "").strip()
+            elif creator.startswith("Tool:"):
+                name = creator.replace("Tool:", "").strip()
+            if name is not None and vendor is not None:
+                tools.append(Tool(vendor=vendor, name=name))
+                name, vendor = None, None
+
+        return Sbom(
+            components=components,
+            metadata=Metadata(tools=tools),
+        )
+
+
+def merge_component_properties(components: Iterable[Component]) -> list[Component]:
+    """Sort and de-duplicate components while merging their `properties`."""
+    components = sorted(components, key=Component.key)
+    grouped_components = groupby(components, key=Component.key)
+
+    def merge_component_group(component_group: Iterable[Component]) -> Component:
+        component_group = list(component_group)
+        prop_sets = (PropertySet.from_properties(c.properties) for c in component_group)
+        merged_prop_set = reduce(PropertySet.merge, prop_sets)
+        component = component_group[0]
+        return component.model_copy(update={"properties": merged_prop_set.to_properties()})
+
+    return [merge_component_group(g) for _, g in grouped_components]
+
+
+# References
+# [1] https://github.com/pydantic/pydantic/blob/6fa92d139a297a26725dec0a7f9b0cce912d6a7f/pydantic/main.py#L383
